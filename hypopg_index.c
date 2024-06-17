@@ -572,7 +572,7 @@ hypo_index_store_parsetree(IndexStmt *node, const char *queryString)
 					/*
 					 * Generated index name will have _expr instead of attname
 					 * in generated index name, and error message will also be
-					 * slighty different in case on unexisting column from a
+					 * slightly different in case on unexisting column from a
 					 * simple attribute, but that's how ComputeIndexAttrs()
 					 * proceed.
 					 */
@@ -653,7 +653,7 @@ hypo_index_store_parsetree(IndexStmt *node, const char *queryString)
 									  entry->relam);
 #endif
 			entry->opclass[attn] = opclass;
-			/* setup the opfamily */
+			/* set up the opfamily */
 			entry->opfamily[attn] = get_opclass_family(opclass);
 
 			entry->opcintype[attn] = get_opclass_input_type(opclass);
@@ -830,7 +830,7 @@ hypo_index_store_parsetree(IndexStmt *node, const char *queryString)
 								 " of an MD5 hash of the value, or use full text "
 								 "indexing\n(which is not yet supported by hypopg)."
 								 )));
-			/* Warn about posssible error with a 80% avg size */
+			/* Warn about possible error with an 80% avg size */
 			else if (ind_avg_width >= HYPO_BTMaxItemSize * .8)
 				ereport(WARNING,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -983,8 +983,8 @@ hypo_index_pfree(hypoIndex * entry)
  * specified relation.  This function also assume that the specified entry
  * already contains every needed information, so we just basically need to copy
  * it from the hypoIndex to the new IndexOptInfo.  Every specific handling is
- * done at store time (ie.  hypo_index_store_parsetree).  The only exception is
- * the size estimation, recomputed verytime, as it needs up to date statistics.
+ * done at store time (i.e., hypo_index_store_parsetree).  The only exception is
+ * the size estimation, recomputed every time, as it needs up-to-date statistics.
  */
 void
 hypo_injectHypotheticalIndex(PlannerInfo *root,
@@ -1372,7 +1372,7 @@ hypopg_create_index(PG_FUNCTION_ARGS)
 }
 
 /*
- * SQL wrapper to drop an hypothetical index.
+ * SQL wrapper to drop a hypothetical index.
  */
 Datum
 hypopg_drop_index(PG_FUNCTION_ARGS)
@@ -1415,10 +1415,10 @@ hypopg_relation_size(PG_FUNCTION_ARGS)
 }
 
 /*
- * Deparse an hypoIndex, indentified by its indexid to the actual CREATE INDEX
+ * Deparse an hypoIndex, identified by its indexid to the actual CREATE INDEX
  * command.
  *
- * Heavilty inspired on pg_get_indexdef_worker()
+ * Heavily inspired on pg_get_indexdef_worker()
  */
 
 Datum
@@ -1867,7 +1867,7 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 #if PG_VERSION_NUM >= 90600
 	int			bloomLength = 5;
 #endif
-	int			additional_bloat = 20;
+	int			additional_bloat = 30;
 	ListCell   *lc;
 
 	for (i = 0; i < entry->ncolumns; i++)
@@ -1875,7 +1875,7 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 
 	if (entry->indpred == NIL)
 	{
-		/* No predicate, as much tuples as estmated on its relation */
+		/* No predicate, as much tuples as estimated on its relation */
 		entry->tuples = rel->tuples;
 	}
 	else
@@ -1911,7 +1911,7 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 
 		/*
 		 * allocate simple_rel_arrays and simple_rte_arrays. This function
-		 * will also setup simple_rte_arrays with the previous rte.
+		 * will also set up simple_rte_arrays with the previous rte.
 		 */
 		setup_simple_rel_arrays(root);
 		/* also add our table info */
@@ -1951,28 +1951,41 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 	if (entry->relam == BTREE_AM_OID)
 	{
 		/* -------------------------------
-		 * quick estimating of index size:
+		 * Rough approximation of an index size:
+		 * The code only estimates leaf pages, not the internal pages and meta pages.
+		 * Further, NULL values and index de-duplication are not considered.
 		 *
-		 * sizeof(PageHeader) : 24 (1 per page)
-		 * sizeof(BTPageOpaqueData): 16 (1 per page)
-		 * sizeof(IndexTupleData): 8 (1 per tuple, referencing heap)
-		 * sizeof(ItemIdData): 4 (1 per tuple, storing the index item)
-		 * default fillfactor: 90%
-		 * no NULL handling
-		 * fixed additional bloat: 20%
+		 * Therefore, we account for an additional bloat of 30%
+		 * Note, overestimating the index size is usually better than underestimating the size.
+		 * For example, if the hypothetical index is redundant, we do not want the planner to choose it
+		 * just because it's slightly smaller than the existing index and thus looks slightly cheaper to use.
 		 *
-		 * I'll also need to read more carefully nbtree code to check if
-		 * this is accurate enough.
+		 * Estimated size per B-tree tuple
+		 *   sizeof(IndexTupleData): 8 (referencing heap)
+		 *   sizeof(ItemIdData): 4 (storing the index item)
+		 *   ind_avg_width: the actual data size based on each key's average attribute width
+		 *
+		 * Additionally, the following data is present once per page:
+		 *   sizeof(PageHeader) : 24 (1 per page)
+		 *   sizeof(BTPageOpaqueData): 16 (1 per page)
+		 *
+		 * Finally, account for:
+		 *   the index pages' default fillfactor for tuple data: 90%
+		 *   fixed additional bloat to account for potential underestimations caused by simplifications: 30%
+		 *
+		 *
+		 * Future versions might better estimate the stored index data based on PostgreSQL's B-tree implementation
 		 *
 		 */
-		line_size = ind_avg_width +
-			+(sizeof(IndexTupleData) * entry->ncolumns)
-			+ MAXALIGN(sizeof(ItemIdData) * entry->ncolumns);
+		line_size = ind_avg_width + MAXALIGN(sizeof(IndexTupleData)) + sizeof(ItemIdData);
 
 		usable_page_size = BLCKSZ - SizeOfPageHeaderData - sizeof(BTPageOpaqueData);
-		bloat_factor = (200.0
-						- (fillfactor == 0 ? BTREE_DEFAULT_FILLFACTOR : fillfactor)
-						+ additional_bloat) / 100;
+		if (fillfactor == 0) {
+			/* Set PostgreSQL's default fillfactor (90) because the user has not specified one during index creation */
+			fillfactor = BTREE_DEFAULT_FILLFACTOR;
+		}
+		/* Set the bloat factor based on the reduced formula: (100.0 / fillfactor) * ((100.0 + additional_bloat) / 100.0); */
+		bloat_factor = (100.0 + additional_bloat) / fillfactor;
 
 		entry->pages = (BlockNumber) (entry->tuples * line_size * bloat_factor / usable_page_size);
 #if PG_VERSION_NUM >= 90300
