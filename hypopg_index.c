@@ -62,6 +62,7 @@
 #if PG_VERSION_NUM >= 120000
 #include "port/pg_bitutils.h"
 #endif
+#include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -122,7 +123,8 @@ static bool hypo_can_return(hypoIndex * entry, Oid atttype, int i, char *amname)
 static void hypo_discover_am(char *amname, Oid oid);
 static void hypo_estimate_index_simple(hypoIndex * entry,
 									   BlockNumber *pages, double *tuples);
-static void hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel);
+static void hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel,
+								Relation reln);
 static int	hypo_estimate_index_colsize(hypoIndex * entry, int col);
 static void hypo_index_pfree(hypoIndex * entry);
 static bool hypo_index_remove(Oid indexid);
@@ -1292,8 +1294,20 @@ hypo_injectHypotheticalIndex(PlannerInfo *root,
 #endif
 
 	/* these has already been handled in hypo_index_store_parsetree() if any */
-	index->indexprs = list_copy(entry->indexprs);
-	index->indpred = list_copy(entry->indpred);
+	index->indexprs = copyObject(entry->indexprs);
+	index->indpred = copyObject(entry->indpred);
+
+	/*
+	 * If the relation isn't the first relation, update any Var reference in
+	 * the hypothetical index expressions to match the actual relid, as all
+	 * expression as stored assuming the relation is the first one.
+	 */
+	if (rel->relid != 1)
+	{
+		ChangeVarNodes((Node *) index->indexprs, 1, rel->relid, 0);
+		ChangeVarNodes((Node *) index->indpred, 1, rel->relid, 0);
+	}
+
 	index->predOK = false;		/* will be set later in indxpath.c */
 
 	/*
@@ -1306,7 +1320,7 @@ hypo_injectHypotheticalIndex(PlannerInfo *root,
 	 * estimate most of the hypothyetical index stuff, more exactly: tuples,
 	 * pages and tree_height (9.3+)
 	 */
-	hypo_estimate_index(entry, rel);
+	hypo_estimate_index(entry, rel, relation);
 
 	index->pages = entry->pages;
 	index->tuples = entry->tuples;
@@ -2064,7 +2078,7 @@ hypo_estimate_index_simple(hypoIndex * entry, BlockNumber *pages, double *tuples
 	/* Close the relation and release the lock now */
 	table_close(relation, AccessShareLock);
 
-	hypo_estimate_index(entry, rel);
+	hypo_estimate_index(entry, rel, relation);
 	*pages = entry->pages;
 	*tuples = entry->tuples;
 }
@@ -2075,7 +2089,7 @@ hypo_estimate_index_simple(hypoIndex * entry, BlockNumber *pages, double *tuples
  * RelOptInfo
  */
 static void
-hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
+hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel, Relation reln)
 {
 	int			i,
 				ind_avg_width = 0;
@@ -2112,6 +2126,7 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 		Query	   *parse;
 		List	   *rtable = NIL;
 		RangeTblEntry *rte;
+		RelOptInfo *hypo_rel;
 
 		/* create a fake minimal PlannerInfo */
 		root = makeNode(PlannerInfo);
@@ -2122,7 +2137,8 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 
 		/* only 1 table: the one related to this hypothetical index */
 		rte = makeNode(RangeTblEntry);
-		rte->relkind = RTE_RELATION;
+		rte->rtekind = RTE_RELATION;
+		rte->relkind = reln->rd_rel->relkind;
 		rte->relid = entry->relid;
 		rte->inh = false;		/* don't include inherited children */
 		rtable = lappend(rtable, rte);
@@ -2136,8 +2152,18 @@ hypo_estimate_index(hypoIndex * entry, RelOptInfo *rel)
 		 * will also set up simple_rte_arrays with the previous rte.
 		 */
 		setup_simple_rel_arrays(root);
-		/* also add our table info */
-		root->simple_rel_array[1] = rel;
+
+		/*
+		 * Also add our table info.  The original relation might not be the
+		 * first relation, but any predicate stored in the hypothetical index
+		 * will assume it is.  Copy the provided relation and override its
+		 * relid to ensure that the table will match the predicate, as it's
+		 * faster than walking expression to override their Var nodes.
+		 */
+		hypo_rel = makeNode(RelOptInfo);
+		memcpy(hypo_rel, rel, sizeof(RelOptInfo));
+		hypo_rel->relid = 1;
+		root->simple_rel_array[1] = hypo_rel;
 
 		/*
 		 * per comment on clause_selectivity(), JOIN_INNER must be passed if
